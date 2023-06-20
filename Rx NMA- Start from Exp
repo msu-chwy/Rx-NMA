@@ -1,0 +1,679 @@
+--------Setting the start and end date-------- 
+BEGIN;
+set (startdate, enddate) = ('2023-05-11','2023-06-11');
+
+-- Standard way to clean the session level attributes based on cliackstream table code
+-- lines 68-82 are from Shravani. This block is to address the problem on unreliable page type in segment for NMA
+-- Lines 65-67, 86-88 neesds to be changed per experiment, timeline and device.
+create
+or replace local temp table ecom_sandbox.nma_sessions as
+SELECT
+    first_value(coalesce(nma_linker_id,properties:nma_linker_id::string)) ignore nulls over (partition BY session_id ORDER BY event_timestamp) nma_linker_id, 
+    convert_timezone('UTC', 'America/New_York', session_start_timestamp)::date session_date,
+    session_id,
+    null personalization_id,
+    authentication_state,
+    first_value(customer_id) ignore nulls over (partition BY session_id ORDER BY event_timestamp) customer_id,
+    'Segment' data_provider,
+    dataset,
+    dataset AS device_category,
+    first_value(new_customer_flag) ignore nulls over (
+        partition BY session_id
+        ORDER BY
+            event_timestamp
+    ) new_customer_flag,
+    first_value(tried_autoship_derived) ignore nulls over (
+        partition BY session_id
+        ORDER BY
+            event_timestamp
+    ) active_autoship_flag,
+    first_value(active_autoship_derived) ignore nulls over (
+        partition BY session_id
+        ORDER BY
+            event_timestamp
+    ) tried_autoship_flag,
+    'nma' channel_grouping,
+    'nma' channel,
+    NULL source,
+    NULL medium,
+    NULL campaign,
+    NULL referer,
+    event_timestamp,
+    MERCH_CLASSIFICATION2,
+    MERCH_CLASSIFICATION4,
+    event_id,
+    event_name,
+    properties:event_category::string as event_category,
+    properties:event_action::string as event_action,
+    properties:event_label::string as event_label,
+    properties,
+    order_id ORDER_ID,
+    PROPERTIES:info:revenueAmount::numeric(38,2) revenue_amount,
+    null transaction_units,
+    first_value(event_timestamp) over (
+        partition BY session_date,
+        session_id
+        ORDER BY
+            event_timestamp
+    ) derived_session_start_dttm,
+    last_value(event_timestamp) over (
+        partition BY session_date,
+        session_id
+        ORDER BY
+            event_timestamp
+    ) derived_session_end_dttm,
+    case
+                when session_traits:experiments:pharmacyinfoatc_enabled::string = 'on' then 'VARIANT'
+                else 'CONTROL'
+            end as Variation,
+    coalesce(event_screen_name::string
+                ,properties:event_screen_name::string
+                ,properties:screenName::string
+                ,properties:eventScreenName::string
+                ,properties:screen_name::string
+                ,traits:event_screen_name::string
+                ,traits:eventScreenName::string
+                ,traits:screen_name::string
+                ,traits:screenName::string
+                ,hit_traits:event_screen_name::string
+                ,hit_traits:eventScreenName::string
+                ,hit_traits:screen_name::string
+                ,hit_traits:screenName::string
+                ,screen_name::string
+                )  as screen_name,
+    widget_description,
+    category_level1,
+    category_level2
+from
+    segment.SEGMENT_NMA_HITS_PRODUCTS a
+left join pdm.product b
+        on a.product_id = b.part_number
+where
+    session_traits:experiments:pharmacyinfoatc_enabled::string in ('on', 'off')
+    and dataset in ('android','ios')
+    and session_start_timestamp::date between $startdate and $enddate;
+
+select variation, count(distinct session_id), count(distinct customer_id) from ecom_sandbox.nma_sessions group by 1;
+
+select * from segment.SEGMENT_NMA_HITS_PRODUCTS where properties:event_action::string in ('purchase') and session_start_timestamp::date='2023-06-12';
+
+--Creating Rx lifetime and Rx L12 flags
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_flags AS
+SELECT customer_id,snapshot_date,
+//new_to_rx_lifetime_flag 
+    case 
+            when mc2_pharmacy_lifecycle_stage in ('INACTIVE','POTENTIAL') -- never ordered from Rx
+            then 'True' 
+            else 'False'
+            END 
+            as new_to_rx_lt,
+//l12m Flag
+    case 
+            when mc2_pharmacy_lifecycle_stage in ('CHURNED') -- means there lastest Rx order was greater than 365 days
+            then 'True' 
+            else 'False'
+            END 
+            as new_to_rx_l12m
+from  ecom_sandbox.PCA_CUSTOMER_RETENTION_STATUS_SNAPSHOT_DAILY
+where snapshot_date between $startdate and $enddate;
+
+--Filter on all sessions that a.have a PDP impression for MC2=Pharmacy, b. Clicked Add to cart button, Add to AS button, or Start AS button on PDP
+create or replace local temp table ecom_sandbox.temp_nma_rx_sessions_pre AS
+SELECT *
+FROM ecom_sandbox.nma_sessions
+WHERE session_id IN (
+    SELECT DISTINCT CASE WHEN funnel_step = 'RX_ATC' THEN session_id END
+    FROM (
+        SELECT funnel_step, session_id
+        FROM ecom_sandbox.nma_sessions
+        MATCH_RECOGNIZE (
+            PARTITION BY session_id
+            ORDER BY event_timestamp
+            MEASURES classifier AS funnel_step
+            ALL ROWS PER MATCH
+            PATTERN ({- RX_PDP -} {- sessions* -} RX_ATC+)
+            DEFINE
+                RX_PDP AS event_name = 'Product Viewed' AND MERCH_CLASSIFICATION2 = 'Pharmacy',
+                RX_ATC AS event_name = 'Product Added' AND MERCH_CLASSIFICATION2 = 'Pharmacy',
+                sessions AS session_id IS NOT NULL
+        )
+        WHERE funnel_step = 'RX_ATC'
+    )
+);
+
+SELECT variation, COUNT(DISTINCT session_id), COUNT(DISTINCT customer_id)
+FROM ecom_sandbox.temp_nma_rx_sessions_pre
+GROUP BY variation;
+
+-- Add Rx lifetime flag to the dataset. Remove customers with invalid customer_id
+create or replace local temp table ecom_sandbox.temp_nma_rx_sessions as 
+select a.*, 
+       first_value(b.new_to_rx_lt) ignore nulls 
+            over(partition by session_id order by event_timestamp) as new_to_rx_lt,
+       first_value(new_to_rx_l12m) ignore nulls 
+            over(partition by session_id order by event_timestamp) as new_to_rx_l12m
+FROM ecom_sandbox.temp_nma_rx_sessions_pre a
+INNER JOIN ecom_sandbox.tmp_flags b
+ON a.customer_id = b.customer_id AND a.session_date = b.snapshot_date;
+
+SELECT variation, COUNT(DISTINCT session_id), COUNT(DISTINCT customer_id)
+FROM ecom_sandbox.temp_nma_rx_sessions
+GROUP BY variation;
+
+-- Standard way to process the order data
+-- order time (line 192) was added to the code so it could be used to determine whether an order is made after the activation in any given session 
+create
+    or replace local temp table nma_sessions_orders  as (
+    with t1 as (
+        select distinct session_id, ol.order_id as order_id, a.order_id sn_order_id, ORDER_PLACED_DTTM
+        from ecom_sandbox.temp_nma_rx_sessions a
+        inner join ecom.order_line ol on a.order_id = ol.order_id
+        where event_name = 'Order Completed'
+        and a.order_id is not null
+            union
+         select distinct session_id, ol.order_id as order_id, a.order_id sn_order_id, ORDER_PLACED_DTTM
+        from ecom_sandbox.temp_nma_rx_sessions a
+        inner join ecom.order_line ol on a.order_id = ol.subscription_id
+        where event_name = 'Order Completed'
+        and a.order_id is not null
+        and order_auto_reorder_subscription_first_shipped_flag
+        and business_channel_name in ('Android App', 'iOS App')
+    )
+       , t3 as(
+        select o.order_id as be_order_id, o.subscription_id, o.business_channel_name, 
+               o.order_auto_reorder_subscription_first_shipped_flag, sum(olm.ORDER_LINE_QUANTITY) as NMA_Units,
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = false
+                           AND o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = false
+                           THEN olm.order_line_total_price
+                       ELSE NULL
+                   END) AS ship_now_Revenue,
+               sum( olm.order_line_total_price) Total_Revenue,
+               (Total_Revenue-ifnull(ship_now_revenue,0)) Merch_Sales,
+               max(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           THEN true
+                       ELSE false
+                   END) first_order_flag,
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           THEN olm.ORDER_LINE_QUANTITY
+                       ELSE 0
+                   END) first_order_units,
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           THEN olm.order_line_total_price
+                       ELSE 0
+                   END) first_order_total_revenue,
+               first_order_total_revenue - ship_now_Revenue first_order_merch_sales,
+               max(CASE
+                       WHEN o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN true
+                       ELSE false
+                   END) autoship_order_flag,
+               sum(CASE
+                       WHEN o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN olm.ORDER_LINE_QUANTITY
+                       ELSE 0
+                   END) autoship_order_units,
+               sum(CASE
+                       WHEN o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN olm.order_line_total_price
+                       ELSE 0
+                   END) autoship_order_total_revenue,
+               autoship_order_total_revenue - ship_now_Revenue autoship_order_merch_sales,
+               max(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           AND o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN true
+                       ELSE false
+                   END) first_order_autoship_flag,
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           AND o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN olm.ORDER_LINE_QUANTITY
+                       ELSE 0
+                   END) first_order_autoship_units,
+               sum(CASE
+                       WHEN o.order_first_order_placed_flag = true
+                           AND o.order_auto_reorder_flag = true
+                           AND o.order_auto_reorder_subscription_first_placed_flag = true
+                           THEN olm.order_line_total_price
+                       ELSE 0
+                   END) first_order_autoship_total_revenue,
+               first_order_autoship_total_revenue - ship_now_Revenue first_order_autoship_merch_sales
+        from ecom.orders o inner join ecom.order_line olm on o.order_id = olm.order_id
+        where olm.ORDER_PLACED_DTTM::date between $startdate and $enddate
+        group by 1,2,3,4
+    )
+       , t4 as(
+        select distinct t1.*, t3.*
+        FROM t1
+                 inner join t3 on t1.order_id = t3.be_order_id
+    )
+        
+    select session_id as order_session_id, ORDER_PLACED_DTTM,
+           SUM (CASE
+                WHEN order_id IS NOT NULL
+                    THEN NMA_Units
+                END)order_units,
+           SUM(
+                   CASE
+                       WHEN order_id IS NOT NULL
+                           THEN Total_Revenue
+                       ELSE 0
+                       END) AS order_total_sales,
+
+           SUM(
+                   CASE
+                       WHEN order_id IS NOT NULL
+                           THEN Merch_Sales
+                       ELSE 0
+                       END) AS order_merch_sales,
+
+           COUNT(DISTINCT
+                 CASE
+                     WHEN first_order_flag = true
+                         THEN order_id
+                     END) AS first_orders,
+           SUM(CASE
+                   WHEN first_order_flag = true
+                       AND order_id IS NOT NULL
+                       THEN first_order_units
+                   ELSE 0
+               END) AS first_order_units,
+           SUM(CASE
+                   WHEN first_order_flag = true
+                       AND order_id IS NOT NULL
+                       THEN first_order_total_revenue
+               END) AS first_order_total_sales,
+           SUM(first_order_merch_sales) AS first_order_merch_sales,
+
+           COUNT(DISTINCT
+                 CASE
+                     WHEN autoship_order_flag = true
+                         THEN order_id
+                     END) AS autoship_orders,
+
+           SUM(CASE
+                   WHEN autoship_order_flag = true
+                       AND order_id IS NOT NULL
+                       THEN autoship_order_units
+
+               END) AS autoship_order_units,
+           SUM(
+                   CASE
+                       WHEN autoship_order_flag = true
+                           then autoship_order_total_revenue
+                       ELSE 0
+                       END) as autoship_order_total_sales,
+
+           SUM(
+                   CASE
+                       WHEN autoship_order_flag = true
+                           AND order_id IS NOT NULL
+                           THEN AUTOSHIP_ORDER_MERCH_SALES
+                       ELSE 0
+                       END) as autoship_order_merch_sales,
+
+           COUNT(DISTINCT
+                 CASE
+                     WHEN FIRST_ORDER_AUTOSHIP_FLAG = true
+                         and order_id IS NOT NULL
+                         THEN order_id
+                     ELSE NULL
+                     END) AS first_order_autoships,
+
+           SUM(
+                   CASE
+                       WHEN first_order_autoship_flag = true
+                           AND order_id IS NOT NULL
+                           THEN FIRST_ORDER_AUTOSHIP_UNITS
+                       ELSE 0
+                       END) AS first_order_autoship_units,
+
+           SUM(
+                   CASE  when first_order_autoship_flag = true
+                       AND order_id IS NOT NULL
+                             then FIRST_ORDER_AUTOSHIP_TOTAL_REVENUE
+                         ELSE 0
+                       END) AS first_order_autoship_total_sales,
+           SUM(
+                   CASE
+                       WHEN first_order_autoship_flag = true
+                           AND order_id IS NOT NULL
+                           THEN FIRST_ORDER_AUTOSHIP_MERCH_SALES
+                       ELSE 0
+                       END) AS first_order_autoship_merch_sales
+    from t4
+    group by 1, 2);
+
+    select * from nma_sessions_orders order by 1;
+
+    
+-- get the activation hit and time
+-- Line 314 needs to be udpated based on activation point
+create
+    or replace local temp table activation_sessions as
+select
+    *
+from
+    (
+        select
+            Variation,
+            nma_linker_id,
+            session_id,
+            event_timestamp,
+            new_to_rx_lt,
+            new_to_rx_l12m,
+            device_category,
+            row_number() over(
+                partition by session_id
+                order by
+                    event_timestamp
+            ) as rank
+        from
+            ecom_sandbox.temp_nma_rx_sessions
+        where
+            event_name = 'Product Added' AND MERCH_CLASSIFICATION2 = 'Pharmacy'
+    )
+where
+    rank = 1;
+    
+
+-- this is to get all events after activation 
+create
+    or replace local temp table sessions as
+select
+    a.session_date,
+    a.event_name,
+    a.event_action,
+    a.event_category,
+    a.event_label,
+    a.order_id,
+    a.session_id,
+    a.event_id,
+    a.nma_linker_id,
+    a.event_timestamp,
+    a.MERCH_CLASSIFICATION2,
+    a.MERCH_CLASSIFICATION4,
+    a.screen_name,
+    a.widget_description,
+    a.category_level1,
+    a.category_level2,
+    b.variation,
+    b.device_category,
+    b.new_to_rx_lt,
+    b.new_to_rx_l12m,
+    b.event_timestamp as activation_time
+from
+    ecom_sandbox.temp_nma_rx_sessions as a
+    inner join activation_sessions as b on a.session_id = b.session_id
+    and timediff(
+        millisecond,
+        a.event_timestamp,
+        b.event_timestamp
+    ) < 1000;
+
+
+-- aggregate on the sessions level    
+create
+    or replace local temp table session_orders as
+select 
+b.order_session_id, 
+sum(b.order_units) as order_units, 
+sum(first_orders) as first_orders,
+sum(first_order_units) as first_order_units,
+sum(first_order_total_sales) as first_order_total_sales,
+sum(first_order_merch_sales) as first_order_merch_sales,
+sum(autoship_orders) as autoship_orders, 
+sum(autoship_order_units) as autoship_order_units, 
+sum(autoship_order_total_sales) as autoship_order_total_sales, 
+sum(autoship_order_merch_sales) as autoship_order_merch_sales, 
+sum(first_order_autoships) as first_order_autoships, 
+sum(first_order_autoship_units) as first_order_autoship_units, 
+sum(first_order_autoship_total_sales) as first_order_autoship_total_sales, 
+sum(first_order_autoship_merch_sales) as first_order_autoship_merch_sales,
+sum(order_total_sales) as order_total_sales, 
+sum(order_merch_sales) as order_merch_sales
+from activation_sessions as a 
+inner join nma_sessions_orders as b
+on a.session_id = b.order_session_id and a.event_timestamp < ORDER_PLACED_DTTM
+group by b.order_session_id
+;
+
+
+-- Funnel steps. More funne steps could be added. 
+-- Definition of each funnel steps are based on Clickstream code (Lines 388-392)
+create or replace local temp table sfw_exp_funnel_steps on commit preserve rows as
+select 
+    funnel_step,
+    session_id,
+    Variation,
+    new_to_rx_lt,
+    new_to_rx_l12m,
+    device_category
+  from sessions
+  match_recognize (
+      partition by session_id, Variation
+      order by event_timestamp
+      MEASURES classifier as funnel_step
+      all rows per match
+      PATTERN({- ATC -} {- sessions* -} checkout+)
+      DEFINE
+      --PDP as event_name = 'Product Viewed',
+      ATC as event_name = 'Product Added',
+      sessions as session_id is not null,
+      checkout as event_name = 'Checkout Started',
+      Purchase as event_name = 'Order Completed'
+    )
+  where funnel_step = 'CHECKOUT'
+
+  union all 
+  
+  select 
+    funnel_step,
+    session_id,
+    Variation,
+    new_to_rx_lt,
+    new_to_rx_l12m,
+    device_category
+  from sessions
+  match_recognize (
+      partition by session_id, Variation
+      order by event_timestamp
+      MEASURES classifier as funnel_step
+      all rows per match
+      PATTERN({- rx_ATC -} {- sessions* -} rx_checkout+)
+      DEFINE
+      rx_PDP as event_name = 'Product Viewed' and MERCH_CLASSIFICATION2='Pharmacy',
+      rx_ATC as event_name = 'Product Added' and MERCH_CLASSIFICATION2='Pharmacy',
+      sessions as session_id is not null,
+      rx_checkout as event_name = 'Checkout Started' and MERCH_CLASSIFICATION2='Pharmacy',
+      rx_Purchase as event_name = 'Order Completed' and MERCH_CLASSIFICATION2='Pharmacy'
+    )
+  where funnel_step = 'RX_CHECKOUT'
+  ;
+  
+
+-- put everything together
+with session_agg as (
+select variation,
+       --new_to_rx_lt,
+       --new_to_rx_l12m,
+       device_category,
+count(distinct session_id) as sessions,
+count(distinct case when orders >0 then session_id end) as purchase_sessions,
+count(distinct case when rx_orders >0 then session_id end) as rx_purchase_sessions,
+sum(orders) as orders,
+sum(rx_orders) as rx_orders,
+sum(ATC_sessions) as ATC_sessions,
+sum(rx_ATC_sessions) as RX_ATC_sessions,
+sum(checkout_sessions) as checkout_sessions,
+sum(rx_checkout_sessions) as RX_checkout_sessions,
+sum(b.order_units) as order_units, 
+--sum(first_orders) as first_orders,
+--sum(first_order_units) as first_order_units,
+--sum(first_order_total_sales) as first_order_total_sales,
+--sum(first_order_merch_sales) as first_order_merch_sales,
+--sum(autoship_orders) as autoship_orders, 
+--sum(autoship_order_units) as autoship_order_units, 
+--sum(autoship_order_total_sales) as autoship_order_total_sales, 
+--sum(autoship_order_merch_sales) as autoship_order_merch_sales, 
+--sum(first_order_autoships) as first_order_autoships, 
+--sum(first_order_autoship_units) as first_order_autoship_units, 
+--sum(first_order_autoship_total_sales) as first_order_autoship_total_sales, 
+--sum(first_order_autoship_merch_sales) as first_order_autoship_merch_sales,
+sum(order_total_sales) as order_total_sales,
+--sum(order_merch_sales) as order_merch_sales
+sum(unique_cl2) as unique_cl2
+from (
+select session_id, variation, 
+--new_to_rx_lt, 
+--new_to_rx_l12m, 
+device_category,
+count(distinct case when event_name = 'Order Completed' then order_id end) as orders,
+count(distinct case when event_name = 'Order Completed' and MERCH_CLASSIFICATION2='Pharmacy' then order_id end) as rx_orders,
+count(distinct case when event_name = 'Product Added' then session_id end) as ATC_sessions,
+count(distinct case when event_name = 'Product Added' and MERCH_CLASSIFICATION2='Pharmacy' then session_id end) as rx_ATC_sessions,
+count(distinct case when event_name = 'Checkout Started' then session_id end) as checkout_sessions,
+count(distinct case when event_name = 'Checkout Started' and MERCH_CLASSIFICATION2='Pharmacy' then session_id end) as rx_checkout_sessions,
+count(distinct category_level2) as unique_cl2
+from sessions 
+group by session_id, variation 
+--,new_to_rx_lt 
+--,new_to_rx_l12m 
+,device_category
+) as a 
+left join session_orders as b
+on a.session_id = b.order_session_id
+group by variation
+--,new_to_rx_lt 
+--,new_to_rx_l12m 
+,device_category
+),
+
+visitor_agg as 
+(
+select variation, 
+--new_to_rx_lt,
+--new_to_rx_l12m, 
+device_category,
+count(distinct nma_linker_id) as visitors
+from sessions 
+group by variation 
+--,new_to_rx_lt 
+--,new_to_rx_l12m 
+,device_category
+),
+
+funnel_agg as (
+select Variation,
+--new_to_rx_lt, 
+--new_to_rx_l12m, 
+device_category,
+count(case when funnel_step='CHECKOUT' then  session_id  end) as ATC_success_sessons,
+count(case when funnel_step='RX_CHECKOUT' then  session_id  end) as RX_ATC_success_sessons
+from sfw_exp_funnel_steps
+group by Variation
+--,new_to_rx_lt 
+--,new_to_rx_l12m 
+,device_category
+),
+
+// metrics of Pet Lovers Also Bought (PLAB) and Pet Lovers Also Shopped For (PLAS) in Post-ATC Smartshelf
+plas_plab_impression as (
+select variation, 
+--new_to_rx_lt, 
+--new_to_rx_l12m, 
+device_category,
+count(distinct case when widget_description IN ('Pet Lovers Also Shopped For','Pet Lovers Also Bought') and screen_name='pdp-atc-upsell' and event_name='Product List Viewed' then session_id end) as PLAS_PLAB_impression_session
+from sessions
+group by variation 
+--,new_to_rx_lt 
+--,new_to_rx_l12m 
+,device_category
+),
+
+plas_plab_clicked as (
+select variation, 
+--new_to_rx_lt, 
+--new_to_rx_l12m, 
+device_category,
+count(distinct case when widget_description IN ('Pet Lovers Also Shopped For','Pet Lovers Also Bought') and screen_name='pdp-atc-upsell' and event_name IN ('Product Clicked','Product Added') then session_id end) as PLAS_PLAB_clicked_session
+from sessions
+where session_id IN (SELECT session_id from sessions where event_name = 'Order Completed')
+group by variation 
+--,new_to_rx_lt 
+--,new_to_rx_l12m
+,device_category
+),
+
+C_level_attach_rate as (
+select variation, 
+--new_to_rx_lt, 
+--new_to_rx_l12m, 
+device_category,
+Count(distinct order_id) as Dog_Food_Orders,
+Count(distinct case when category_level2 IN ('Treats','Prescription Treats','Health & Wellness','Toys') or MERCH_CLASSIFICATION4='Dog Litter' then order_id else null end) as Dog_Food_Treat_Toy_HW_Litter_Orders
+from sessions
+where order_id IN (
+                select distinct order_id
+                from sessions
+                where category_level1 = 'Dog'
+                and category_level2 in ('Food', 'Prescription Food')
+                )
+group by variation 
+--,new_to_rx_lt 
+--,new_to_rx_l12m 
+,device_category
+)
+
+select a.*, b.visitors, 
+        c.ATC_success_sessons, c.RX_ATC_success_sessons, 
+        d.PLAS_PLAB_impression_session, 
+        e.PLAS_PLAB_clicked_session,
+        f.Dog_Food_Orders, f.Dog_Food_Treat_Toy_HW_Litter_Orders
+from session_agg as a
+left join visitor_agg as b
+on a.variation = b.variation
+--and a.new_to_rx_lt = b.new_to_rx_lt
+--and a.new_to_rx_l12m = b.new_to_rx_l12m
+and a.device_category=b.device_category
+left join funnel_agg as c
+on a.variation = c.variation
+--and a.new_to_rx_lt = c.new_to_rx_lt
+--and a.new_to_rx_l12m = c.new_to_rx_l12m
+and a.device_category=c.device_category
+left join plas_plab_impression as d
+on a.variation = d.variation
+--and a.new_to_rx_lt = d.new_to_rx_lt
+--and a.new_to_rx_l12m = d.new_to_rx_l12m
+and a.device_category=d.device_category
+left join plas_plab_clicked as e
+on a.variation = e.variation
+--and a.new_to_rx_lt = e.new_to_rx_lt
+--and a.new_to_rx_l12m = e.new_to_rx_l12m
+and a.device_category=e.device_category
+left join C_level_attach_rate as f
+on a.variation = f.variation
+--and a.new_to_rx_lt = f.new_to_rx_lt
+--and a.new_to_rx_l12m = f.new_to_rx_l12m
+and a.device_category=f.device_category
+;
+
+CREATE OR REPLACE TABLE ecom_sandbox.nma_sessions_collect_petvet_rxpdp AS
+select a.*, ol.order_line_total_price, ol.ORDER_LINE_QUANTITY 
+from ecom_sandbox.temp_nma_rx_sessions a
+inner join ecom.order_line ol on a.order_id = ol.order_id
+where event_name = 'Order Completed'
+and a.order_id is not null
+and ol.ORDER_PLACED_DTTM::date between $startdate and $enddate;
+
+select * from ecom_sandbox.nma_sessions_collect_petvet_rxpdp;
